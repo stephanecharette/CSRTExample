@@ -3,19 +3,69 @@
 
 
 #include <opencv2/opencv.hpp>
+#include <opencv2/tracking/tracker.hpp>
 
 
-/** These next few variables would be in a structure that gets passed around.
- * For ths simple example code I didn't make a structure and have them as globals.
+typedef cv::Ptr<cv::Tracker> Tracker;	///< single object tracker (could be any OpenCV tracker, not just CSRT)
+
+struct ObjectTracker
+{
+	bool		is_valid;	///< used to detremine if this tracker should be used or skipped
+	std::string	name;		///< name we give to the tracker for debug purposes
+	cv::Scalar	colour;		///< colour we'll use to draw the output onto the mat
+	cv::Rect2d	rect;		///< last reported rectangle for this tracker
+	size_t		last_valid;	///< last frame index where this tracker reported positive results
+	Tracker		tracker;	///< CSRT tracker
+
+	/// Create an object Tracker from a rectangle and an image.
+	ObjectTracker(const std::string n, const cv::Scalar c, const cv::Rect2d r, cv::Mat & mat) :
+		is_valid(true),
+		name(n),
+		colour(c),
+		rect(r),
+		last_valid(0)
+	{
+		tracker = cv::TrackerCSRT::create();
+		tracker->init(mat, rect);
+		return;
+	}
+
+	/// Create an object Tracker from 4 normalized X,Y,W,H values instead of a cv::Rect2d.
+	ObjectTracker(const std::string n, const cv::Scalar c, const double x, const double y, const double w, const double h, cv::Mat & mat) :
+		ObjectTracker(n, c, cv::Rect2d(x * mat.cols, y * mat.rows, w * mat.cols, h * mat.rows), mat)
+	{
+		return;
+	}
+};
+
+
+typedef std::vector<ObjectTracker> VObjectTrackers;
+
+
+/** These next few variables would be in a structure or class that gets passed around.
+ * For this example code I kept it simple and left them as globals.
  * @{
  */
 std::chrono::high_resolution_clock::duration frame_duration;
 cv::VideoCapture cap;
-size_t fps_rounded = 0;
-size_t total_frames = 0;
-size_t total_wait_in_milliseconds = 0;
 cv::Size desired_size(1024, 768);
-std::string window_title = "CSRT Example";
+bool enable_object_tracking				= true;
+std::string window_title				= "CSRT Example";
+size_t fps_rounded						= 0;
+size_t total_frames						= 0;
+/// @}
+
+/// All trackers used while the video is being processed (people, ball, etc).
+VObjectTrackers all_trackers;
+
+
+/// Remember that OpenCV uses BGR, not RGB. @{
+const cv::Scalar red	(0.0	, 0.0	, 255.0	);
+const cv::Scalar blue	(255.0	, 0.0	, 0.0	);
+const cv::Scalar green	(0.0	, 255.0	, 0.0	);
+const cv::Scalar purple	(128.0	, 0.0	, 128.0	);
+const cv::Scalar black	(0.0	, 0.0	, 0.0	);
+const cv::Scalar white	(255.0	, 255.0	, 255.0	);
 /// @}
 
 
@@ -81,8 +131,7 @@ void initialize_video(const std::string & filename)
 }
 
 
-/// Pause on the very first frame and reset the video to the start.
-void pause_on_first_frame()
+cv::Mat get_first_frame()
 {
 	cap.set(cv::VideoCaptureProperties::CAP_PROP_POS_FRAMES, 0.0);
 	cv::Mat mat;
@@ -96,6 +145,48 @@ void pause_on_first_frame()
 		mat = tmp;
 	}
 
+	return mat;
+}
+
+
+/** Initialize the trackers with the coordinates of the objects we need to track.  Normally, the coordinates would need
+ * to come from something else, like the output of a neural network.  But this example code doesn't have a neural network
+ * or any other place where we get the coordinates.  Instead, this function has some hard-coded coordinates which I've
+ * manually calculated beforehand as objects of interest so we can demo CSRT object tracking.
+ */
+void initialize_trackers(cv::Mat & mat, const std::string & filename)
+{
+	/* All coordinates in this function are normalized.  This allows the code to work regardless of the
+	 * "desired size" set at the top of this file.  Once we multiply the desired by the normalized values
+	 * we'll get the coordinates which OpenCV expects us to be using.
+	 */
+
+	if (filename.find("input_3733.mp4") != std::string::npos)	// 3 kids passing the ball on soccer field.  Tracker quickly loses track of the ball but maintains track on the kids.
+	{
+		all_trackers.emplace_back("ball", green	, 0.697435897, 0.539062500, 0.029304029, 0.052083333, mat);
+		all_trackers.emplace_back("p1"	, red	, 0.704029304, 0.207031250, 0.083516484, 0.359375000, mat);
+		all_trackers.emplace_back("p2"	, blue	, 0.032967033, 0.276041667, 0.122344322, 0.458333333, mat);
+		all_trackers.emplace_back("p3"	, purple, 0.083516484, 0.087239583, 0.069597070, 0.272135417, mat);
+	}
+	else if (filename.find("input_3750.mp4") != std::string::npos)	// 2 kids on basekeball court.  Tracker loses the one in the background.
+	{
+		all_trackers.emplace_back("p1"	, red	, 0.565567766, 0.471354167, 0.099633700, 0.528645833, mat);
+		all_trackers.emplace_back("p2"	, blue	, 0.441758242, 0.533854167, 0.070329670, 0.330729167, mat);
+	}
+
+	// go through the trackers again, this time to draw all the original rectangles onto the image
+	for (auto & ot : all_trackers)
+	{
+		cv::rectangle(mat, ot.rect, ot.colour);
+	}
+
+	return;
+}
+
+
+/// Pause on the very first frame and reset the video to the start.
+void pause_on_first_frame(cv::Mat & mat)
+{
 	std::cout << "Press any key to start.." << std::endl;
 	cv::imshow(window_title, mat);
 	cv::waitKey(-1);
@@ -105,10 +196,12 @@ void pause_on_first_frame()
 /// Loop through the entire video, showing every frame.  Press @p ESC to exit, any other key to pause.
 void show_video()
 {
+	size_t frame_counter = 0;
 	auto time_to_show_next_frame = std::chrono::high_resolution_clock::now();
+	auto previous_timestamp = time_to_show_next_frame;
+	size_t previous_frame_counter = 0;
 
 	// read the video and display each frame
-	size_t frame_counter = 0;
 	while (true)
 	{
 		cv::Mat mat;
@@ -119,17 +212,21 @@ void show_video()
 			break;
 		}
 
-		frame_counter ++;
-		if (frame_counter == total_frames or frame_counter % fps_rounded == 0)
+		// once per second we want to display some information on where we are and the FPS
+		if (frame_counter + 1 >= total_frames or frame_counter % fps_rounded == 0)
 		{
-			const double average_wait_in_milliseconds = static_cast<double>(total_wait_in_milliseconds) / static_cast<double>(fps_rounded);
+			const auto now				= std::chrono::high_resolution_clock::now();
+			const auto duration			= now - previous_timestamp;
+			const auto recent_frames	= frame_counter - previous_frame_counter;
+			const auto fps				= 1000.0 * recent_frames / std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
+			previous_frame_counter		= frame_counter;
+			previous_timestamp			= now;
 
 			std::cout
 				<< "-> processing frame # " << frame_counter << "/" << total_frames
-				<< " (" << (100.0 * frame_counter / total_frames) << "%), "
-				<< "average pause is " << average_wait_in_milliseconds << " milliseconds"
+				<< " (" << (100.0 * (frame_counter + 1) / total_frames) << "%), "
+				<< fps << " FPS"
 				<< std::endl;
-			total_wait_in_milliseconds = 0;
 		}
 
 		if (mat.size() != desired_size)
@@ -139,13 +236,56 @@ void show_video()
 			mat = tmp;
 		}
 
+		// now we update all the CSRT trackers
+		for (auto & ot : all_trackers)
+		{
+			if (ot.is_valid)
+			{
+				// this next call takes a *LONG* time to run!
+				const bool ok = ot.tracker->update(mat, ot.rect);
+				if (ok)
+				{
+					ot.last_valid = frame_counter;
+				}
+				else
+				{
+					// we've lost the object...is it temporary?
+					ot.rect = cv::Rect2d(-1.0, -1.0, -1.0, -1.0);
+
+					if (frame_counter > ot.last_valid + fps_rounded * 3)
+					{
+						std::cout << "-> removing tracker for \"" << ot.name << "\" since object not seen since frame #" << ot.last_valid << "" << std::endl;
+						ot.is_valid = false;
+					}
+				}
+			}
+		}
+
+		// and finally we draw all the recent tracker rectangles onto the image
+		for (auto & ot : all_trackers)
+		{
+			if (ot.last_valid == frame_counter)
+			{
+				cv::rectangle(mat, ot.rect, ot.colour);
+			}
+		}
+
 		const auto now = std::chrono::high_resolution_clock::now();
-		const auto milliseconds_to_pause = std::chrono::duration_cast<std::chrono::milliseconds>(time_to_show_next_frame - now).count();
-		total_wait_in_milliseconds += milliseconds_to_pause;
-		if (milliseconds_to_pause > 0)
+		auto number_of_milliseconds_to_pause = std::chrono::duration_cast<std::chrono::milliseconds>(time_to_show_next_frame - now).count();
+		if (number_of_milliseconds_to_pause <= 0)
+		{
+#if 1
+			// For this example code only, we're going to wait a minimum of 1 millisecond.  This will ensure
+			// that OpenCV gets time to redraw the window.  Otherwise we might not see anything since tracking
+			// is so slow that we'll always be falling behind.
+			number_of_milliseconds_to_pause = 1;
+#endif
+		}
+
+		if (number_of_milliseconds_to_pause > 0)
 		{
 			// too early to show the next frame, we may need to briefly pause
-			auto key = cv::waitKey(milliseconds_to_pause);
+			auto key = cv::waitKey(number_of_milliseconds_to_pause);
 			if (key != -1 and key != 27)
 			{
 				// user has pressed a key -- assume they're asking to pause the video
@@ -162,6 +302,7 @@ void show_video()
 		}
 		cv::imshow(window_title, mat);
 		time_to_show_next_frame += frame_duration;
+		frame_counter ++;
 	}
 
 	return;
@@ -182,7 +323,12 @@ int main(int argc, char *argv[])
 		}
 
 		initialize_video(filename);
-		pause_on_first_frame();
+		cv::Mat mat = get_first_frame();
+		if (enable_object_tracking)
+		{
+			initialize_trackers(mat, filename);
+		}
+		pause_on_first_frame(mat);
 		show_video();
 
 		// and pause again on the last frame which was shown
